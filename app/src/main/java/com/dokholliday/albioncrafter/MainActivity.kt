@@ -77,7 +77,7 @@ fun AlbionApp() {
     var ready by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        runCatching { PythonBridge.start(context) }
+        runCatching { PythonBridge.startAsync(context) }
             .onFailure { appStatus.startupError = it.message ?: it.toString() }
         appStatus.refresh { ready = true }
     }
