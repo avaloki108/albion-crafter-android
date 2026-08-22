@@ -113,13 +113,12 @@ def main() -> int:
     assert by_key[("Bridgewatch", "toolmaker")]["displayed_fee"] == 999.0
     assert settings["settings"]["allow_stale_station_fees"] is True
 
+    from albion_crafter.core.stations import StationType
+
     alchemist_observation = bridge._STATE["station_fee_repository"].get(
         "americas",
         "Bridgewatch",
-        __import__(
-            "albion_crafter.core.stations",
-            fromlist=["StationType"],
-        ).StationType.ALCHEMIST_LAB,
+        StationType.ALCHEMIST_LAB,
     )
     stale_evidence = bridge._station_evidence(
         "americas",
