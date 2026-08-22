@@ -585,6 +585,240 @@ def update_static_data(op_id: str, force: bool, sink) -> str:
 # --------------------------------------------------------------------------
 
 
+LOADOUT_SLOT_FILTERS = {
+    "main_hand": (("weapons",), ()),
+    "off_hand": (("offhands",), ()),
+    "head": (("head",), ()),
+    "chest": (("armors",), ()),
+    "shoes": (("shoes",), ()),
+    "bag": (("bags",), ()),
+    "cape": (("capes",), ()),
+    "mount": (("mounts",), ()),
+    "potion": (("consumables",), ("potions",)),
+    "food": (("consumables",), ("food",)),
+}
+
+
+def _item_matches_loadout_slot(item, slot: str) -> bool:
+    filters = LOADOUT_SLOT_FILTERS.get(slot)
+    if filters is None:
+        return False
+    categories, subcategories = filters
+    category = str(getattr(item, "category", "")).casefold()
+    subcategory = str(getattr(item, "subcategory", "")).casefold()
+    return category in categories and (not subcategories or subcategory in subcategories)
+
+
+def _is_two_handed(item) -> bool:
+    return (
+        str(getattr(item, "category", "")).casefold() == "weapons"
+        and "2H" in str(item.item_id).upper().split("_")
+    )
+
+
+def _estimated_base_item_power(item) -> int | None:
+    """Return a transparent tier/enchantment baseline, before quality or mastery.
+
+    Artifact and awakened modifiers are not persisted in the current catalog, so
+    callers must label this as an estimate and may replace it with observed IP.
+    """
+
+    equippable = any(
+        _item_matches_loadout_slot(item, slot) for slot in LOADOUT_SLOT_FILTERS
+    )
+    if item.tier is None or not equippable:
+        return None
+    return (int(item.tier) + 3 + int(item.enchantment)) * 100
+
+
+def _serialize_loadout_item(item, *, slot: str) -> dict:
+    return {
+        "item_id": item.item_id,
+        "name": item.display_name,
+        "tier": item.tier,
+        "enchantment": item.enchantment,
+        "category": item.category,
+        "subcategory": item.subcategory,
+        "max_quality": item.max_quality or 1,
+        "slot": slot,
+        "two_handed": _is_two_handed(item),
+        "estimated_base_ip": _estimated_base_item_power(item),
+    }
+
+
+def loadout_search(slot: str, query: str, limit: int = 40) -> str:
+    """Search only items which can occupy the requested Albion loadout slot."""
+
+    _ensure_stack()
+    normalized_slot = str(slot).strip().casefold()
+    filters = LOADOUT_SLOT_FILTERS.get(normalized_slot)
+    if filters is None:
+        _fail(f"unknown loadout slot {slot!r}")
+    categories, subcategories = filters
+    bounded_limit = min(max(int(limit), 1), 100)
+    matches = _STATE["catalog_repository"].search_items(
+        str(query),
+        categories=categories,
+        subcategories=subcategories,
+        limit=bounded_limit,
+    )
+    return json.dumps(
+        {
+            "ok": True,
+            "slot": normalized_slot,
+            "results": [
+                _serialize_loadout_item(item, slot=normalized_slot) for item in matches
+            ],
+        }
+    )
+
+
+def _loadout_request_items(request: dict) -> list[tuple[str, object, int, int]]:
+    raw_items = request.get("items", {})
+    if not isinstance(raw_items, dict):
+        _fail("loadout items must be an object keyed by slot")
+    catalog = _STATE["catalog_repository"]
+    selected: list[tuple[str, object, int, int]] = []
+    for slot, payload in raw_items.items():
+        normalized_slot = str(slot).strip().casefold()
+        if normalized_slot not in LOADOUT_SLOT_FILTERS:
+            _fail(f"unknown loadout slot {slot!r}")
+        if not isinstance(payload, dict):
+            _fail(f"loadout slot {slot!r} must contain an item object")
+        item_id = str(payload.get("item_id", "")).strip()
+        catalog_item = catalog.get_item(item_id)
+        if catalog_item is None:
+            _fail(f"catalog item unavailable for {item_id or slot}")
+        item = catalog_item.item
+        if not _item_matches_loadout_slot(item, normalized_slot):
+            _fail(f"{item_id} cannot be equipped in {normalized_slot}")
+        quality = int(payload.get("quality", 1))
+        max_quality = item.max_quality or 1
+        if not 1 <= quality <= max_quality:
+            _fail(f"quality for {item_id} must be between 1 and {max_quality}")
+        quantity = int(payload.get("quantity", 1))
+        if not 1 <= quantity <= 999:
+            _fail(f"quantity for {item_id} must be between 1 and 999")
+        selected.append((normalized_slot, item, quality, quantity))
+    return selected
+
+
+def loadout_evaluate(request_json: str) -> str:
+    """Price a saved build from cache and expose per-slot market evidence."""
+
+    _ensure_stack()
+    from albion_crafter.core.freshness import FreshnessPolicy
+    from albion_crafter.market.models import MarketSide, Region
+
+    request = json.loads(request_json)
+    settings = _STATE["settings_repository"]
+    region = Region(str(request.get("region", settings.get("region", "americas"))))
+    city = str(request.get("city", settings.get("default_material_buy_city", "Bridgewatch")))
+    side = MarketSide(str(request.get("price_side", "sell_order")))
+    freshness_policy = FreshnessPolicy(
+        timedelta(hours=int(settings.get("max_market_age_hours", 4)))
+    )
+    selected = _loadout_request_items(request)
+    selected_by_slot = {slot: item for slot, item, _, _ in selected}
+    two_handed = _is_two_handed(selected_by_slot["main_hand"]) if "main_hand" in selected_by_slot else False
+
+    rows = []
+    known_total = 0.0
+    priced_count = 0
+    warnings: list[str] = []
+    for slot, item, quality, quantity in selected:
+        if slot == "off_hand" and two_handed:
+            warnings.append("Off Hand is ignored because Main Hand is two-handed.")
+            continue
+        line = _STATE["resolver"].resolve_item(
+            item.item_id,
+            city=city,
+            quality=quality,
+            region=region,
+            side=side,
+            freshness_policy=freshness_policy,
+            role=f"loadout:{slot}",
+        )
+        line_total = line.price * quantity if line.price is not None else None
+        if line_total is not None:
+            known_total += line_total
+            priced_count += 1
+        rows.append(
+            {
+                **_serialize_loadout_item(item, slot=slot),
+                "quality": quality,
+                "quantity": quantity,
+                "unit_price": line.price,
+                "line_total": line_total,
+                "source": str(line.source),
+                "confidence": str(line.confidence),
+                "freshness": str(line.freshness),
+                "observed_at": line.observation_timestamp.isoformat()
+                if line.observation_timestamp
+                else None,
+                "fetched_at": line.fetched_at.isoformat() if line.fetched_at else None,
+            }
+        )
+    missing_count = len(rows) - priced_count
+    return json.dumps(
+        {
+            "ok": True,
+            "region": region.value,
+            "city": city,
+            "price_side": side.value,
+            "known_total": known_total,
+            "complete": missing_count == 0,
+            "priced_count": priced_count,
+            "selected_count": len(rows),
+            "missing_count": missing_count,
+            "items": rows,
+            "warnings": warnings,
+        }
+    )
+
+
+def loadout_refresh_prices(op_id: str, request_json: str, sink) -> str:
+    """Explicitly refresh the small set of main items in one loadout."""
+
+    _ensure_stack()
+    from albion_crafter.market.aodp import AODPClient
+    from albion_crafter.market.cache import CachedMarketService
+    from albion_crafter.market.models import Region
+
+    request = json.loads(request_json)
+    settings = _STATE["settings_repository"]
+    region = Region(str(request.get("region", settings.get("region", "americas"))))
+    city = str(request.get("city", settings.get("default_material_buy_city", "Bridgewatch")))
+    selected = _loadout_request_items(request)
+    item_ids = tuple(dict.fromkeys(item.item_id for _, item, _, _ in selected))
+    qualities = tuple(dict.fromkeys(quality for _, _, quality, _ in selected))
+    if not item_ids:
+        return json.dumps({"ok": False, "error": "Add at least one item before refreshing."})
+
+    service = CachedMarketService(AODPClient(region), _STATE["market_repository"])
+    forward = _make_progress_forwarder(op_id, sink, "loadout_refresh")
+    try:
+        result = service.refresh(
+            item_ids,
+            cities=(city,),
+            qualities=qualities,
+            is_cancelled=_cancellation_check(op_id),
+            on_progress=forward,
+        )
+    finally:
+        _finish_op(op_id)
+    return json.dumps(
+        {
+            "ok": not bool(result.failures),
+            "cancelled": result.cancelled,
+            "batches_completed": result.completed_batches,
+            "batches_failed": result.failed_batches,
+            "records": result.records_returned,
+            "errors": [failure.message for failure in result.failures],
+        }
+    )
+
+
 def catalog_search(query: str, limit: int) -> str:
     _ensure_stack()
     catalog = _STATE["catalog_repository"]
