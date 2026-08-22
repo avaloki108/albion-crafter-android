@@ -23,6 +23,93 @@ _INIT_LOCK = threading.Lock()
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
 _CANCEL_LOCK = threading.Lock()
 
+ANDROID_STATION_FEE_SEED_VERSION = 1
+ANDROID_STATION_FEE_SEED_VERSION_KEY = "android_station_fee_seed_version"
+ALLOW_STALE_STATION_FEES_KEY = "allow_stale_station_fees"
+
+# User-entered station fees copied from the desktop database on 2026-08-21.
+# Original observation timestamps are preserved so relaunching never makes old
+# evidence look newly observed.
+PACKAGED_STATION_FEE_SEED = (
+    (
+        "americas",
+        "Bridgewatch",
+        "alchemist_lab",
+        930.0,
+        "2026-08-21T22:01:01.719161+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "cook",
+        480.0,
+        "2026-08-21T22:01:03.665300+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "hunter_lodge",
+        800.0,
+        "2026-08-21T22:01:06.331360+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "mage_tower",
+        810.0,
+        "2026-08-21T22:01:08.863349+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "mill",
+        0.0,
+        "2026-08-21T22:01:10.584292+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "stonemason",
+        400.0,
+        "2026-08-21T22:01:14.026363+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "tanner",
+        800.0,
+        "2026-08-21T22:01:15.681453+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "toolmaker",
+        830.0,
+        "2026-08-21T22:01:17.695106+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "warrior_forge",
+        820.0,
+        "2026-08-21T22:01:19.426162+00:00",
+    ),
+    (
+        "americas",
+        "Bridgewatch",
+        "weaver",
+        830.0,
+        "2026-08-21T22:01:22.869249+00:00",
+    ),
+    (
+        "americas",
+        "Fort Sterling",
+        "hunter_lodge",
+        800.0,
+        "2026-08-21T22:01:25.074240+00:00",
+    ),
+)
+
 
 class BridgeError(RuntimeError):
     pass
@@ -83,6 +170,11 @@ def _ensure_stack() -> None:
     snapshot_repository = PlanSnapshotRepository(database)
     preferences_repository = FindMoneyPreferencesRepository(settings_repository)
 
+    seeded_station_fee_count = _seed_android_station_fees(
+        station_fee_repository,
+        settings_repository,
+    )
+
     resolver = PriceResolver(
         market_repository, override_repository, history_repository
     )
@@ -111,6 +203,7 @@ def _ensure_stack() -> None:
             "history_repository": history_repository,
             "snapshot_repository": snapshot_repository,
             "preferences_repository": preferences_repository,
+            "seeded_station_fee_count": seeded_station_fee_count,
             "resolver": resolver,
             "refresh_service": refresh_service,
             "scanner_service": scanner_service,
@@ -128,6 +221,52 @@ def _ensure_stack() -> None:
 
     _STATE["service_factory"] = service_for_region
     _set_region(Region(str(settings_repository.get("region", Region.AMERICAS.value))))
+
+
+def _seed_android_station_fees(station_fees, settings) -> int:
+    """Seed the user's desktop snapshot once without replacing Android edits."""
+    try:
+        installed_version = int(
+            settings.get(ANDROID_STATION_FEE_SEED_VERSION_KEY, 0)
+        )
+    except (TypeError, ValueError):
+        installed_version = 0
+    if installed_version >= ANDROID_STATION_FEE_SEED_VERSION:
+        return 0
+
+    from albion_crafter.core.provenance import Provenance
+    from albion_crafter.core.stations import StationFeeObservation, StationType
+
+    inserted = 0
+    for (
+        region,
+        city,
+        station_value,
+        displayed_fee,
+        observed_at_text,
+    ) in PACKAGED_STATION_FEE_SEED:
+        station_type = StationType(station_value)
+        if station_fees.get(region, city, station_type) is not None:
+            continue
+        station_fees.set(
+            StationFeeObservation(
+                region=region,
+                city=city,
+                station_type=station_type,
+                displayed_fee=displayed_fee,
+                observed_at=datetime.fromisoformat(observed_at_text),
+                provenance=Provenance.USER_OVERRIDE,
+            )
+        )
+        inserted += 1
+
+    setting_updates = {
+        ANDROID_STATION_FEE_SEED_VERSION_KEY: ANDROID_STATION_FEE_SEED_VERSION,
+    }
+    if settings.get(ALLOW_STALE_STATION_FEES_KEY, None) is None:
+        setting_updates[ALLOW_STALE_STATION_FEES_KEY] = True
+    settings.set_many(setting_updates)
+    return inserted
 
 
 def _set_region(region) -> None:
@@ -332,6 +471,7 @@ DEFAULT_SETTINGS_KEYS = (
     "default_sell_city",
     "max_market_age_hours",
     "max_station_fee_age_hours",
+    ALLOW_STALE_STATION_FEES_KEY,
 )
 
 
@@ -345,6 +485,7 @@ SETTINGS_DEFAULTS = {
     "default_sell_city": "Bridgewatch",
     "max_market_age_hours": 4,
     "max_station_fee_age_hours": 24,
+    ALLOW_STALE_STATION_FEES_KEY: True,
 }
 
 
@@ -357,6 +498,9 @@ def list_settings() -> str:
     }
     data["premium"] = bool(data.get("premium", True))
     data["focus_enabled"] = bool(data.get("focus_enabled", False))
+    data[ALLOW_STALE_STATION_FEES_KEY] = bool(
+        data.get(ALLOW_STALE_STATION_FEES_KEY, True)
+    )
     return json.dumps({"ok": True, "settings": data})
 
 
