@@ -253,6 +253,20 @@ fun CalculatorScreen(modifier: Modifier) {
                         AmberAging,
                     )
                 }
+                if (
+                    station != null &&
+                    station.optBoolean("present") &&
+                    station.optString("freshness").equals("stale", ignoreCase = true) &&
+                    station.optBoolean("allow_stale")
+                ) {
+                    Banner(
+                        "Using the saved ${station.optString("station")} fee from " +
+                            station.optString("observed_at").take(10) +
+                            ". It remains usable as advisory evidence; update it in Settings " +
+                            "when the in-game fee changes.",
+                        AmberAging,
+                    )
+                }
                 val fce = payload.optJSONObject("fce_evidence")
                 if (fce != null) {
                     Text(

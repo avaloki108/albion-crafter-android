@@ -30,21 +30,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 private val STATIONS = listOf(
-    "blacksmith" to "Blacksmith",
-    "weapon_smith" to "Weapon Smith",
-    "armorsmith" to "Armorsmith",
-    "tailor" to "Tailor",
-    "cobblery" to "Cobblery",
-    "tanner" to "Tanner",
-    "carpenter" to "Carpenter",
+    "warrior_forge" to "Warrior's Forge",
+    "hunter_lodge" to "Hunter's Lodge",
+    "mage_tower" to "Mage's Tower",
     "toolmaker" to "Toolmaker",
-    "furnace" to "Furnace",
-    "smelter" to "Smelter",
-    "mill" to "Mill",
-    "weaver" to "Weaver",
-    "tannery" to "Tannery",
-    "stonemason" to "Stonemason",
+    "cook" to "Cook",
     "alchemist_lab" to "Alchemist's Lab",
+    "mill" to "Mill",
+    "butcher" to "Butcher",
+    "smelter" to "Smelter",
+    "lumbermill" to "Lumbermill",
+    "tanner" to "Tanner",
+    "weaver" to "Weaver",
+    "stonemason" to "Stonemason",
 )
 
 private val REGIONS = listOf("americas", "europe", "asia", "australia")
@@ -64,9 +62,10 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
     var availableFocus by remember { mutableStateOf("10000") }
     var marketAge by remember { mutableStateOf("4") }
     var stationAge by remember { mutableStateOf("24") }
+    var allowStaleStationFees by remember { mutableStateOf(true) }
 
     var feeCity by remember { mutableStateOf("Bridgewatch") }
-    var feeStation by remember { mutableStateOf("blacksmith") }
+    var feeStation by remember { mutableStateOf("warrior_forge") }
     var feeValue by remember { mutableStateOf("") }
 
     var matrixLevels by remember { mutableStateOf(mapOf<String, String>()) }
@@ -83,6 +82,7 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
                     availableFocus = s.optInt("available_focus", 10000).toString()
                     marketAge = s.optInt("max_market_age_hours", 4).toString()
                     stationAge = s.optInt("max_station_fee_age_hours", 24).toString()
+                    allowStaleStationFees = s.optBoolean("allow_stale_station_fees", true)
                 }
             }
         }
@@ -114,6 +114,7 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
             .put("available_focus", availableFocus.toIntOrNull() ?: 10000)
             .put("max_market_age_hours", marketAge.toIntOrNull() ?: 4)
             .put("max_station_fee_age_hours", stationAge.toIntOrNull() ?: 24)
+            .put("allow_stale_station_fees", allowStaleStationFees)
         PythonBridge.callAsync("save_settings", payload.toString()) { res ->
             res.onSuccess {
                 savedMessage = "Settings saved"
@@ -159,6 +160,19 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
                 label = { Text("Max station fee age (hours)") },
                 singleLine = true,
             )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = allowStaleStationFees,
+                    onCheckedChange = { allowStaleStationFees = it },
+                )
+                Text("Keep saved station fees usable when stale")
+            }
+            Text(
+                "Stale fees keep their real observation date and are treated as advisory, " +
+                    "not newly observed.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+            )
             Button(onClick = { saveSettings() }, modifier = Modifier.fillMaxWidth()) {
                 Text("Save settings")
             }
@@ -168,6 +182,12 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
         }
 
         SectionCard("Station Fees") {
+            Text(
+                "Desktop fees are seeded once into Android storage. App updates preserve " +
+                    "your saved values and later edits.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+            )
             fees?.let { arr ->
                 (0 until arr.length()).forEach { i ->
                     val fee = arr.optJSONObject(i) ?: return@forEach
@@ -195,7 +215,6 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
                                     .put("region", fee.optString("region"))
                                     .put("city", fee.optString("city"))
                                     .put("station_type", fee.optString("station_type"))
-                                    .put("observed_at", fee.optString("observed_at"))
                                     .toString(),
                             ) { loadAll() }
                         }) {
@@ -208,10 +227,12 @@ fun SettingsScreen(modifier: Modifier, appStatus: AppStatus) {
                 CityPicker("City", feeCity) { feeCity = it }
                 CityPicker(
                     label = "Station",
-                    value = STATIONS.firstOrNull { it.first == feeStation }?.second ?: "Blacksmith",
+                    value = STATIONS.firstOrNull { it.first == feeStation }?.second
+                        ?: "Warrior's Forge",
                     options = STATIONS.map { it.second },
                 ) { name ->
-                    feeStation = STATIONS.firstOrNull { it.second == name }?.first ?: "blacksmith"
+                    feeStation = STATIONS.firstOrNull { it.second == name }?.first
+                        ?: "warrior_forge"
                 }
                 OutlinedTextField(
                     value = feeValue,

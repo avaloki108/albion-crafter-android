@@ -661,8 +661,14 @@ def calculator_evaluate(request_json: str) -> str:
         station_observation = _STATE["station_fee_repository"].get(
             region, craft_city, station_type
         )
-    station_policy = FreshnessPolicy(
-        timedelta(hours=int(settings.get("max_station_fee_age_hours", 24)))
+    max_station_fee_age_hours = int(settings.get("max_station_fee_age_hours", 24))
+    allow_stale_station_fees = bool(
+        settings.get(ALLOW_STALE_STATION_FEES_KEY, True)
+    )
+    station_policy = (
+        None
+        if allow_stale_station_fees
+        else FreshnessPolicy(timedelta(hours=max_station_fee_age_hours))
     )
     profile = _STATE["crafting_profile_repository"].load()
     fce_resolution = profile.resolve(focus_skill_mapping_for_recipe(recipe))
@@ -699,7 +705,11 @@ def calculator_evaluate(request_json: str) -> str:
             "output_price": snapshot.output_price,
             "actionability": _serialize_actionability(snapshot.actionability),
             "station_fee_evidence": _station_evidence(
-                region, station_type, station_observation
+                region,
+                station_type,
+                station_observation,
+                max_age_hours=max_station_fee_age_hours,
+                allow_stale=allow_stale_station_fees,
             ),
             "fce_evidence": _fce_evidence(fce_resolution),
             "station_type": station_type.value if station_type else None,
@@ -730,22 +740,39 @@ def _serialize_actionability(assessment) -> dict:
     }
 
 
-def _station_evidence(region, station_type, observation) -> dict:
+def _station_evidence(
+    region,
+    station_type,
+    observation,
+    *,
+    max_age_hours: int,
+    allow_stale: bool,
+) -> dict:
     if observation is None:
         return {
             "present": False,
             "station": station_type.display_name if station_type else None,
+            "allow_stale": allow_stale,
         }
+    from albion_crafter.core.freshness import Freshness, FreshnessPolicy
+
+    now = datetime.now(UTC)
+    freshness = FreshnessPolicy(timedelta(hours=max_age_hours)).classify(
+        observation.observed_at,
+        now=now,
+    )
+    age_hours = max((now - observation.observed_at).total_seconds() / 3600.0, 0.0)
     return {
         "present": True,
         "station": observation.station_type.display_name,
         "city": observation.city,
         "displayed_fee": observation.displayed_fee,
         "observed_at": observation.observed_at.isoformat(),
-        "age_hours": (
-            datetime.now(UTC) - observation.observed_at
-        ).total_seconds()
-        / 3600.0,
+        "age_hours": age_hours,
+        "freshness": freshness.value,
+        "allow_stale": allow_stale,
+        "usable": freshness is not Freshness.FUTURE
+        and (freshness is not Freshness.STALE or allow_stale),
     }
 
 
@@ -955,6 +982,7 @@ def _constraints_from_request(request: dict):
             return None
         return frozenset(str(v).strip() for v in value if str(v).strip())
 
+    settings = _STATE["settings_repository"]
     kwargs: dict = {
         "available_silver": int(request.get("available_silver", 1_000_000)),
         "available_focus": int(request.get("available_focus", 10_000)),
@@ -969,9 +997,19 @@ def _constraints_from_request(request: dict):
         "use_focus": bool(request.get("use_focus", False)),
         "max_market_age": timedelta(hours=int(request.get("max_market_age_hours", 4))),
         "max_station_fee_age": timedelta(
-            hours=int(request.get("max_station_fee_age_hours", 24))
+            hours=int(
+                request.get(
+                    "max_station_fee_age_hours",
+                    settings.get("max_station_fee_age_hours", 24),
+                )
+            )
         ),
-        "allow_stale_station_fees": bool(request.get("allow_stale_station_fees", False)),
+        "allow_stale_station_fees": bool(
+            request.get(
+                ALLOW_STALE_STATION_FEES_KEY,
+                settings.get(ALLOW_STALE_STATION_FEES_KEY, True),
+            )
+        ),
         "minimum_profit": request.get("minimum_profit"),
         "minimum_roi": request.get("minimum_roi"),
         "sale_method": SaleMethod(str(request.get("sale_method", "sell_order"))),
@@ -1226,8 +1264,11 @@ def scanner_run(op_id: str, constraints_json: str, sink) -> str:
             )
         return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
 
+    settings = _STATE["settings_repository"]
     constraints = ScanConstraints(
-        region=Region(str(request.get("region", "americas"))),
+        region=Region(
+            str(request.get("region", settings.get("region", "americas")))
+        ),
         craft_cities=city_tuple(request.get("craft_cities", ("Bridgewatch",))),
         sell_cities=city_tuple(request.get("sell_cities", ("Bridgewatch",))),
         material_city=request.get("material_city") or None,
@@ -1239,6 +1280,12 @@ def scanner_run(op_id: str, constraints_json: str, sink) -> str:
         use_focus=bool(request.get("use_focus", False)),
         available_focus=float(request.get("available_focus", 0)),
         premium=bool(request.get("premium", True)),
+        maximum_station_fee_age=timedelta(
+            hours=int(settings.get("max_station_fee_age_hours", 24))
+        ),
+        allow_stale_station_fees=bool(
+            settings.get(ALLOW_STALE_STATION_FEES_KEY, True)
+        ),
         actionable_only=bool(request.get("actionable_only", True)),
         minimum_profit=request.get("minimum_profit"),
         minimum_roi=request.get("minimum_roi"),
@@ -1335,14 +1382,10 @@ def station_fee_remove(fee_json: str) -> str:
     from albion_crafter.core.stations import StationType
 
     request = json.loads(fee_json)
-    observed_at = datetime.fromisoformat(str(request["observed_at"]))
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=UTC)
     removed = _STATE["station_fee_repository"].remove(
         str(request["region"]),
         str(request["city"]),
         StationType(str(request["station_type"])),
-        observed_at,
     )
     return json.dumps({"ok": True, "removed": bool(removed)})
 

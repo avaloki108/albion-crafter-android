@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +51,29 @@ def main() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="ac-bridge-test-"))
     if SOURCE_DB.exists():
         shutil.copy2(SOURCE_DB, workdir / "albion-crafter.db")
+        with sqlite3.connect(workdir / "albion-crafter.db") as connection:
+            connection.execute("DELETE FROM station_fees")
+            connection.execute(
+                "DELETE FROM settings WHERE key IN (?, ?)",
+                (
+                    "android_station_fee_seed_version",
+                    "allow_stale_station_fees",
+                ),
+            )
+            # A newer Android edit must win over the packaged desktop seed.
+            connection.execute(
+                """INSERT INTO station_fees (
+                       region, city, station_type, displayed_fee, observed_at, provenance
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    "americas",
+                    "Bridgewatch",
+                    "toolmaker",
+                    999.0,
+                    datetime.now(UTC).isoformat(),
+                    "user_override",
+                ),
+            )
         print(f"Using copy of real DB in {workdir}")
     else:
         print(f"WARNING: no real DB at {SOURCE_DB}; testing with empty database")
@@ -75,6 +100,70 @@ def main() -> int:
 
     fees = check("station_fees_list", bridge.station_fees_list("americas"))
     print(f"     fees: {len(fees['fees'])}")
+    assert len(fees["fees"]) == 11
+    by_key = {
+        (fee["city"], fee["station_type"]): fee
+        for fee in fees["fees"]
+    }
+    assert by_key[("Bridgewatch", "alchemist_lab")]["displayed_fee"] == 930.0
+    assert by_key[("Bridgewatch", "alchemist_lab")]["observed_at"] == (
+        "2026-08-21T22:01:01.719161+00:00"
+    )
+    assert by_key[("Fort Sterling", "hunter_lodge")]["displayed_fee"] == 800.0
+    assert by_key[("Bridgewatch", "toolmaker")]["displayed_fee"] == 999.0
+    assert settings["settings"]["allow_stale_station_fees"] is True
+
+    alchemist_observation = bridge._STATE["station_fee_repository"].get(
+        "americas",
+        "Bridgewatch",
+        __import__(
+            "albion_crafter.core.stations",
+            fromlist=["StationType"],
+        ).StationType.ALCHEMIST_LAB,
+    )
+    stale_evidence = bridge._station_evidence(
+        "americas",
+        None,
+        alchemist_observation,
+        max_age_hours=1,
+        allow_stale=True,
+    )
+    assert stale_evidence["freshness"].lower() == "stale"
+    assert stale_evidence["usable"] is True
+
+    removed = check(
+        "station_fee_remove",
+        bridge.station_fee_remove(
+            json.dumps(
+                {
+                    "region": "americas",
+                    "city": "Bridgewatch",
+                    "station_type": "alchemist_lab",
+                }
+            )
+        ),
+    )
+    assert removed["removed"] is True
+    assert bridge._seed_android_station_fees(
+        bridge._STATE["station_fee_repository"],
+        bridge._STATE["settings_repository"],
+    ) == 0
+    after_remove = json.loads(bridge.station_fees_list("americas"))
+    assert len(after_remove["fees"]) == 10
+    check(
+        "station_fee_restore",
+        bridge.station_fee_set(
+            json.dumps(
+                {
+                    "region": "americas",
+                    "city": "Bridgewatch",
+                    "station_type": "alchemist_lab",
+                    "displayed_fee": 930.0,
+                    "observed_at": "2026-08-21T22:01:01.719161+00:00",
+                }
+            )
+        ),
+    )
 
     profile = check("crafting_profile_get", bridge.crafting_profile_get())
     print(f"     focus: {profile['available_focus']} skills: {len(profile['skill_levels'])}")
